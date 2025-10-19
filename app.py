@@ -21,6 +21,7 @@ import requests
 APP_TITLE = "Bokningar"
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "bookings.csv"
+CONTACTS_FILE = DATA_DIR / "contacts.csv"
 # Make.com webhook (kan sättas i .streamlit/secrets.toml)
 DEFAULT_MAKE_URL = st.secrets.get("MAKE_WEBHOOK_URL", "https://hook.eu2.make.com/b3errrh3g6qttaxya7b8ge1egggwiqs6")
 DEFAULT_MAKE_HEADER_NAME = st.secrets.get("MAKE_HEADER_NAME", "")
@@ -43,6 +44,19 @@ def ensure_data_store() -> None:
             ]
         )
         df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+    if not CONTACTS_FILE.exists():
+        cf = pd.DataFrame(
+            columns=[
+                "id",
+                "skapad",
+                "namn",
+                "telefon",
+                "foretag",
+                "mail",
+                "kommentar",
+            ]
+        )
+        cf.to_csv(CONTACTS_FILE, index=False, encoding="utf-8")
 
 
 def load_bookings() -> pd.DataFrame:
@@ -70,6 +84,16 @@ def append_booking(row: dict) -> None:
     df = load_bookings()
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+
+
+def append_contact(row: dict) -> None:
+    ensure_data_store()
+    try:
+        dfc = pd.read_csv(CONTACTS_FILE, dtype=str, encoding="utf-8")
+    except Exception:
+        dfc = pd.DataFrame(columns=["id","skapad","namn","telefon","foretag","mail","kommentar"])
+    dfc = pd.concat([dfc, pd.DataFrame([row])], ignore_index=True)
+    dfc.to_csv(CONTACTS_FILE, index=False, encoding="utf-8")
 
 
 def send_to_make(webhook_url: str, payload: dict, headers: dict | None = None) -> tuple[bool, str]:
@@ -108,6 +132,21 @@ def build_payload(row: dict) -> dict:
             "start_local_iso": iso_start_local,
             "start_epoch_ms": epoch_ms,
         },
+        "meta": {
+            "sent_at": datetime.now().isoformat(timespec="seconds"),
+            "app_title": APP_TITLE,
+            "source": "streamlit",
+        },
+    }
+    return payload
+
+
+def build_contact_payload(row: dict) -> dict:
+    """Payload för kontaktförfrågningar."""
+    payload = {
+        "type": "contact_created",
+        "version": 1,
+        "contact": row,
         "meta": {
             "sent_at": datetime.now().isoformat(timespec="seconds"),
             "app_title": APP_TITLE,
@@ -165,70 +204,117 @@ with st.sidebar:
 
 # -------- Sidor -------- #
 if page == "Ny bokning":
-    st.subheader("Lägg till ny bokning")
+    st.subheader("Lägg till ny bokning eller kontakt")
 
-    with st.form(key="booking_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            kund = st.text_input("Kund *", placeholder="Företag/Person")
-            datum = st.date_input("Datum *", value=date.today(), format="YYYY-MM-DD")
-            plats = st.text_input("Plats *", placeholder="Adress/Ort")
-        with col2:
-            uppdrag = st.text_input("Uppdrag *", placeholder="Ex. Möte, Workshop, Gig")
-            tid = st.time_input("Tid *", value=time(9, 0), step=300)  # 5-min steg
-            ersattning = st.text_input("Ersättning", placeholder="Ex. 4500 SEK eller timpris")
+    tab_bokning, tab_kontakt = st.tabs(["➕ Bokning", "📇 Kontakt / Frågor"])
 
-        st.markdown("<span class='small-muted'>Fält markerade med * är obligatoriska.</span>", unsafe_allow_html=True)
-        submitted = st.form_submit_button("Spara bokning", type="primary")
+    with tab_bokning:
+        with st.form(key="booking_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                kund = st.text_input("Kund *", placeholder="Företag/Person")
+                datum = st.date_input("Datum *", value=date.today(), format="YYYY-MM-DD")
+                plats = st.text_input("Plats *", placeholder="Adress/Ort")
+            with col2:
+                uppdrag = st.text_input("Uppdrag *", placeholder="Ex. Möte, Workshop, Gig")
+                tid = st.time_input("Tid *", value=time(9, 0), step=300)
+                ersattning = st.text_input("Ersättning", placeholder="Ex. 4500 SEK eller timpris")
 
-    if submitted:
-        # Validering
-        errors = []
-        if not kund.strip():
-            errors.append("Kund saknas.")
-        if not uppdrag.strip():
-            errors.append("Uppdrag saknas.")
-        if not plats.strip():
-            errors.append("Plats saknas.")
-        if not isinstance(datum, date):
-            errors.append("Datum är ogiltigt.")
-        if not isinstance(tid, time):
-            errors.append("Tid är ogiltig.")
+            st.markdown("<span class='small-muted'>Fält markerade med * är obligatoriska.</span>", unsafe_allow_html=True)
+            submitted = st.form_submit_button("Spara bokning", type="primary")
 
-        if errors:
-            st.error("\n".join(errors))
-        else:
-            booking_id = str(uuid.uuid4())
-            now_iso = datetime.now().isoformat(timespec="seconds")
-            row = {
-                "id": booking_id,
-                "skapad": now_iso,
-                "kund": kund.strip(),
-                "uppdrag": uppdrag.strip(),
-                "datum": str(datum),
-                "tid": tid.strftime("%H:%M"),
-                "plats": plats.strip(),
-                "ersattning": ersattning.strip(),
-            }
-            append_booking(row)
-            st.success("Bokningen sparades.")
+        if submitted:
+            errors = []
+            if not kund.strip():
+                errors.append("Kund saknas.")
+            if not uppdrag.strip():
+                errors.append("Uppdrag saknas.")
+            if not plats.strip():
+                errors.append("Plats saknas.")
+            if not isinstance(datum, date):
+                errors.append("Datum är ogiltigt.")
+            if not isinstance(tid, time):
+                errors.append("Tid är ogiltig.")
 
-            # --- Skicka till Make.com webhook om satt ---
-            webhook_url = st.session_state.get("make_url") or DEFAULT_MAKE_URL
-            headers = {}
-            if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
-                headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
-
-            payload = build_payload(row)
-            ok, msg = send_to_make(webhook_url, payload, headers=headers)
-            if ok:
-                st.info(f"Skickat till Make: {msg}")
+            if errors:
+                st.error("\n".join(errors))
             else:
-                st.warning(f"Kunde inte skicka till Make: {msg}")
-            with st.expander("Visa sparad post"):
-                st.json(row)
-            with st.expander("Visa skickad payload till Make"):
-                st.json(payload)
+                booking_id = str(uuid.uuid4())
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                row = {
+                    "id": booking_id,
+                    "skapad": now_iso,
+                    "kund": kund.strip(),
+                    "uppdrag": uppdrag.strip(),
+                    "datum": str(datum),
+                    "tid": tid.strftime("%H:%M"),
+                    "plats": plats.strip(),
+                    "ersattning": ersattning.strip(),
+                }
+                append_booking(row)
+                st.success("Bokningen sparades.")
+
+                webhook_url = st.session_state.get("make_url") or DEFAULT_MAKE_URL
+                headers = {}
+                if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
+                    headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
+
+                payload = build_payload(row)
+                ok, msg = send_to_make(webhook_url, payload, headers=headers)
+                if ok:
+                    st.info(f"Skickat till Make: {msg}")
+                else:
+                    st.warning(f"Kunde inte skicka till Make: {msg}")
+                with st.expander("Visa sparad post"):
+                    st.json(row)
+                with st.expander("Visa skickad payload till Make"):
+                    st.json(payload)
+
+    with tab_kontakt:
+        with st.form(key="contact_form", clear_on_submit=True):
+            cname = st.text_input("Namn *", placeholder="För- och efternamn")
+            cphone = st.text_input("Telefon", placeholder="+46...")
+            ccompany = st.text_input("Företag", placeholder="Företagsnamn")
+            cemail = st.text_input("Mail *", placeholder="namn@domän.se")
+            ccomment = st.text_area("Kommentar / frågor", placeholder="Skriv din fråga eller kommentar här...", height=120)
+            st.markdown("<span class='small-muted'>Fält markerade med * är obligatoriska.</span>", unsafe_allow_html=True)
+            csubmitted = st.form_submit_button("Skicka förfrågan", type="secondary")
+
+        if csubmitted:
+            cerrs = []
+            if not cname.strip():
+                cerrs.append("Namn saknas.")
+            if not cemail.strip():
+                cerrs.append("Mail saknas.")
+            if cerrs:
+                st.error("\n".join(cerrs))
+            else:
+                cid = str(uuid.uuid4())
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                crow = {
+                    "id": cid,
+                    "skapad": now_iso,
+                    "namn": cname.strip(),
+                    "telefon": cphone.strip(),
+                    "foretag": ccompany.strip(),
+                    "mail": cemail.strip(),
+                    "kommentar": ccomment.strip(),
+                }
+                append_contact(crow)
+                st.success("Tack! Din förfrågan är skickad.")
+
+                webhook_url = st.session_state.get("make_url") or DEFAULT_MAKE_URL
+                headers = {}
+                if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
+                    headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
+                cpayload = build_contact_payload(crow)
+                ok, msg = send_to_make(webhook_url, cpayload, headers=headers)
+                if ok:
+                    st.info(f"Skickat till Make: {msg}")
+                else:
+                    st.warning(f"Kunde inte skicka till Make: {msg}")
+                with st.expander("Visa skickad kontaktpayload"):
+                    st.json(cpayload)
 
 elif page == "Alla bokningar":
     st.subheader("Samtliga bokningar")
