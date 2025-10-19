@@ -85,6 +85,38 @@ def send_to_make(webhook_url: str, payload: dict, headers: dict | None = None) -
         return False, f"Webhook undantag: {e}"
 
 
+def build_payload(row: dict) -> dict:
+    """Bygg ett rikt payload så att Make får *all* formulärdata + lite metadata.
+    - "booking" innehåller exakt det som sparas i CSV.
+    - "derived" innehåller härledda fält (kombinerad starttid, epoch etc.).
+    - "meta" innehåller app- och tidsinfo.
+    """
+    # Kombinera datum + tid till ISO (lokal, utan tzinfo)
+    try:
+        dt_local = datetime.strptime(f"{row['datum']} {row['tid']}", "%Y-%m-%d %H:%M")
+        iso_start_local = dt_local.isoformat(timespec="minutes")
+        epoch_ms = int(dt_local.timestamp() * 1000)
+    except Exception:
+        iso_start_local = None
+        epoch_ms = None
+
+    payload = {
+        "type": "booking_created",
+        "version": 1,
+        "booking": row,  # all form fields 1:1
+        "derived": {
+            "start_local_iso": iso_start_local,
+            "start_epoch_ms": epoch_ms,
+        },
+        "meta": {
+            "sent_at": datetime.now().isoformat(timespec="seconds"),
+            "app_title": APP_TITLE,
+            "source": "streamlit",
+        },
+    }
+    return payload
+
+
 # -------- UI & Layout -------- #
 st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="centered")
 
@@ -187,13 +219,16 @@ if page == "Ny bokning":
             if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
                 headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
 
-            ok, msg = send_to_make(webhook_url, row, headers=headers)
+            payload = build_payload(row)
+            ok, msg = send_to_make(webhook_url, payload, headers=headers)
             if ok:
                 st.info(f"Skickat till Make: {msg}")
             else:
                 st.warning(f"Kunde inte skicka till Make: {msg}")
             with st.expander("Visa sparad post"):
                 st.json(row)
+            with st.expander("Visa skickad payload till Make"):
+                st.json(payload)
 
 elif page == "Alla bokningar":
     st.subheader("Samtliga bokningar")
