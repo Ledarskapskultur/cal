@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit – Bokningsformulär med sidomeny
+Streamlit – Bokningsformulär + Kontakt + Kanban-tavla
 
 Kör lokalt:
-  streamlit run streamlit_bokningsform_app.py
+  streamlit run streamlit_bokningsform_app_v3.py
 
-Placera filen i din GitHub/Streamlit-app. Data sparas i ./data/bookings.csv
-(Notera: filsystemet är temporärt på Streamlit Cloud – byt till extern datakälla vid behov.)
+Data lagras i ./data/*.csv
+- bookings.csv  (bokningar)
+- contacts.csv  (kontaktförfrågningar)
+
+Obs: Kanban i Streamlit är enkel (ingen drag & drop). Du kan byta status
+på kort via en select och appen sparar tillbaka.
 """
 from __future__ import annotations
 
 import uuid
 from pathlib import Path
 from datetime import date, time, datetime
+from typing import Literal
 
 import pandas as pd
 import streamlit as st
@@ -22,10 +27,21 @@ APP_TITLE = "Bokningar"
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "bookings.csv"
 CONTACTS_FILE = DATA_DIR / "contacts.csv"
+
 # Make.com webhook (kan sättas i .streamlit/secrets.toml)
-DEFAULT_MAKE_URL = st.secrets.get("MAKE_WEBHOOK_URL", "https://hook.eu2.make.com/b3errrh3g6qttaxya7b8ge1egggwiqs6")
+DEFAULT_MAKE_URL = st.secrets.get(
+    "MAKE_WEBHOOK_URL",
+    "https://hook.eu2.make.com/b3errrh3g6qttaxya7b8ge1egggwiqs6",
+)
 DEFAULT_MAKE_HEADER_NAME = st.secrets.get("MAKE_HEADER_NAME", "")
 DEFAULT_MAKE_HEADER_VALUE = st.secrets.get("MAKE_HEADER_VALUE", "")
+
+KANBAN_STATI: tuple[Literal["Ny", "Pågående", "Klar", "Arkiv"], ...] = (
+    "Ny",
+    "Pågående",
+    "Klar",
+    "Arkiv",
+)
 
 # -------- Hjälpfunktioner -------- #
 def ensure_data_store() -> None:
@@ -41,6 +57,7 @@ def ensure_data_store() -> None:
                 "tid",
                 "plats",
                 "ersattning",
+                "status",  # Kanban-status
             ]
         )
         df.to_csv(DATA_FILE, index=False, encoding="utf-8")
@@ -54,6 +71,7 @@ def ensure_data_store() -> None:
                 "foretag",
                 "mail",
                 "kommentar",
+                "status",  # Kanban-status
             ]
         )
         cf.to_csv(CONTACTS_FILE, index=False, encoding="utf-8")
@@ -64,40 +82,47 @@ def load_bookings() -> pd.DataFrame:
     try:
         df = pd.read_csv(DATA_FILE, dtype=str, encoding="utf-8")
     except Exception:
-        # Fallback om filen är tom/trasig
-        df = pd.DataFrame(
-            columns=[
-                "id",
-                "skapad",
-                "kund",
-                "uppdrag",
-                "datum",
-                "tid",
-                "plats",
-                "ersattning",
-            ]
-        )
+        df = pd.DataFrame(columns=["id","skapad","kund","uppdrag","datum","tid","plats","ersattning","status"])
+    # Fallback status
+    if "status" not in df.columns:
+        df["status"] = "Ny"
+    df["status"] = df["status"].fillna("Ny")
     return df
+
+
+def load_contacts() -> pd.DataFrame:
+    ensure_data_store()
+    try:
+        dfc = pd.read_csv(CONTACTS_FILE, dtype=str, encoding="utf-8")
+    except Exception:
+        dfc = pd.DataFrame(columns=["id","skapad","namn","telefon","foretag","mail","kommentar","status"])
+    if "status" not in dfc.columns:
+        dfc["status"] = "Ny"
+    dfc["status"] = dfc["status"].fillna("Ny")
+    return dfc
+
+
+def save_bookings(df: pd.DataFrame) -> None:
+    df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+
+
+def save_contacts(dfc: pd.DataFrame) -> None:
+    dfc.to_csv(CONTACTS_FILE, index=False, encoding="utf-8")
 
 
 def append_booking(row: dict) -> None:
     df = load_bookings()
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+    save_bookings(df)
 
 
 def append_contact(row: dict) -> None:
-    ensure_data_store()
-    try:
-        dfc = pd.read_csv(CONTACTS_FILE, dtype=str, encoding="utf-8")
-    except Exception:
-        dfc = pd.DataFrame(columns=["id","skapad","namn","telefon","foretag","mail","kommentar"])
+    dfc = load_contacts()
     dfc = pd.concat([dfc, pd.DataFrame([row])], ignore_index=True)
-    dfc.to_csv(CONTACTS_FILE, index=False, encoding="utf-8")
+    save_contacts(dfc)
 
 
 def send_to_make(webhook_url: str, payload: dict, headers: dict | None = None) -> tuple[bool, str]:
-    """Skicka JSON till Make.com webhook. Returnerar (ok, message)."""
     if not webhook_url:
         return False, "Ingen webhook-url angiven."
     try:
@@ -109,12 +134,7 @@ def send_to_make(webhook_url: str, payload: dict, headers: dict | None = None) -
         return False, f"Webhook undantag: {e}"
 
 
-def build_payload(row: dict) -> dict:
-    """Bygg ett rikt payload så att Make får *all* formulärdata + lite metadata.
-    - "booking" innehåller exakt det som sparas i CSV.
-    - "derived" innehåller härledda fält (kombinerad starttid, epoch etc.).
-    - "meta" innehåller app- och tidsinfo.
-    """
+def build_booking_payload(row: dict) -> dict:
     # Kombinera datum + tid till ISO (lokal, utan tzinfo)
     try:
         dt_local = datetime.strptime(f"{row['datum']} {row['tid']}", "%Y-%m-%d %H:%M")
@@ -124,10 +144,10 @@ def build_payload(row: dict) -> dict:
         iso_start_local = None
         epoch_ms = None
 
-    payload = {
+    return {
         "type": "booking_created",
         "version": 1,
-        "booking": row,  # all form fields 1:1
+        "booking": row,
         "derived": {
             "start_local_iso": iso_start_local,
             "start_epoch_ms": epoch_ms,
@@ -138,12 +158,10 @@ def build_payload(row: dict) -> dict:
             "source": "streamlit",
         },
     }
-    return payload
 
 
 def build_contact_payload(row: dict) -> dict:
-    """Payload för kontaktförfrågningar."""
-    payload = {
+    return {
         "type": "contact_created",
         "version": 1,
         "contact": row,
@@ -153,25 +171,13 @@ def build_contact_payload(row: dict) -> dict:
             "source": "streamlit",
         },
     }
-    return payload
 
 
 # -------- UI & Layout -------- #
-st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="centered")
+st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="wide")
 
-# Minimal stil för renare formulär
-st.markdown(
-    """
-    <style>
-      .small-muted { color: #6b7280; font-size: 0.9rem; }
-      .success-badge { background:#10b98122; padding:0.3rem 0.6rem; border-radius:0.5rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("📅 Bokningsformulär")
-st.caption("En enkel grund som du kan bygga vidare på – lagrar lokalt i CSV.")
+st.title("📅 Bokningsverktyg")
+st.caption("Bokningar, kontaktförfrågningar och en enkel kanban-tavla.")
 
 # Sidomeny
 with st.sidebar:
@@ -179,17 +185,17 @@ with st.sidebar:
     page = st.radio(
         "Gå till",
         (
-            "Ny bokning",
+            "Ny post",
+            "Kanban",
             "Alla bokningar",
             "Export / Import",
             "Inställningar",
         ),
         index=0,
     )
-    st.markdown("<p class='small-muted'>Den här menyn är förberedd för framtida sidor.</p>", unsafe_allow_html=True)
 
     with st.expander("Integrationer (Make.com)"):
-        st.text("Skicka bokningar till ett Make-scenario via webhook.")
+        st.text("Skicka poster till ett Make-scenario via webhook.")
         st.session_state.setdefault("make_url", DEFAULT_MAKE_URL)
         st.session_state.setdefault("make_header_name", DEFAULT_MAKE_HEADER_NAME)
         st.session_state.setdefault("make_header_value", DEFAULT_MAKE_HEADER_VALUE)
@@ -201,9 +207,8 @@ with st.sidebar:
             st.session_state["make_header_value"] = st.text_input("Valfri header-värde", value=st.session_state["make_header_value"], type="password")
         st.caption("Tips: Lägg dessa värden i secrets för drift.")
 
-
 # -------- Sidor -------- #
-if page == "Ny bokning":
+if page == "Ny post":
     st.subheader("Lägg till ny bokning eller kontakt")
 
     tab_bokning, tab_kontakt = st.tabs(["➕ Bokning", "📇 Kontakt / Frågor"])
@@ -219,8 +224,6 @@ if page == "Ny bokning":
                 uppdrag = st.text_input("Uppdrag *", placeholder="Ex. Möte, Workshop, Gig")
                 tid = st.time_input("Tid *", value=time(9, 0), step=300)
                 ersattning = st.text_input("Ersättning", placeholder="Ex. 4500 SEK eller timpris")
-
-            st.markdown("<span class='small-muted'>Fält markerade med * är obligatoriska.</span>", unsafe_allow_html=True)
             submitted = st.form_submit_button("Spara bokning", type="primary")
 
         if submitted:
@@ -231,11 +234,6 @@ if page == "Ny bokning":
                 errors.append("Uppdrag saknas.")
             if not plats.strip():
                 errors.append("Plats saknas.")
-            if not isinstance(datum, date):
-                errors.append("Datum är ogiltigt.")
-            if not isinstance(tid, time):
-                errors.append("Tid är ogiltig.")
-
             if errors:
                 st.error("\n".join(errors))
             else:
@@ -250,25 +248,22 @@ if page == "Ny bokning":
                     "tid": tid.strftime("%H:%M"),
                     "plats": plats.strip(),
                     "ersattning": ersattning.strip(),
+                    "status": "Ny",
                 }
                 append_booking(row)
                 st.success("Bokningen sparades.")
 
+                # Skicka till Make
                 webhook_url = st.session_state.get("make_url") or DEFAULT_MAKE_URL
                 headers = {}
                 if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
                     headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
-
-                payload = build_payload(row)
+                payload = build_booking_payload(row)
                 ok, msg = send_to_make(webhook_url, payload, headers=headers)
-                if ok:
-                    st.info(f"Skickat till Make: {msg}")
-                else:
-                    st.warning(f"Kunde inte skicka till Make: {msg}")
+                st.info(msg if ok else msg)
+
                 with st.expander("Visa sparad post"):
                     st.json(row)
-                with st.expander("Visa skickad payload till Make"):
-                    st.json(payload)
 
     with tab_kontakt:
         with st.form(key="contact_form", clear_on_submit=True):
@@ -277,7 +272,6 @@ if page == "Ny bokning":
             ccompany = st.text_input("Företag", placeholder="Företagsnamn")
             cemail = st.text_input("Mail *", placeholder="namn@domän.se")
             ccomment = st.text_area("Kommentar / frågor", placeholder="Skriv din fråga eller kommentar här...", height=120)
-            st.markdown("<span class='small-muted'>Fält markerade med * är obligatoriska.</span>", unsafe_allow_html=True)
             csubmitted = st.form_submit_button("Skicka förfrågan", type="secondary")
 
         if csubmitted:
@@ -299,6 +293,7 @@ if page == "Ny bokning":
                     "foretag": ccompany.strip(),
                     "mail": cemail.strip(),
                     "kommentar": ccomment.strip(),
+                    "status": "Ny",
                 }
                 append_contact(crow)
                 st.success("Tack! Din förfrågan är skickad.")
@@ -309,12 +304,58 @@ if page == "Ny bokning":
                     headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
                 cpayload = build_contact_payload(crow)
                 ok, msg = send_to_make(webhook_url, cpayload, headers=headers)
-                if ok:
-                    st.info(f"Skickat till Make: {msg}")
-                else:
-                    st.warning(f"Kunde inte skicka till Make: {msg}")
-                with st.expander("Visa skickad kontaktpayload"):
-                    st.json(cpayload)
+                st.info(msg if ok else msg)
+
+elif page == "Kanban":
+    st.subheader("Kanban – Bokningar & Kontakter")
+    df = load_bookings()
+    dfc = load_contacts()
+
+    # Sammanställ en gemensam vy
+    bk = df.copy()
+    if not bk.empty:
+        bk["typ"] = "Bokning"
+        bk["titel"] = bk["kund"].fillna("") + " – " + bk["uppdrag"].fillna("")
+        bk["beskrivning"] = (
+            "📅 " + bk["datum"].fillna("") + " " + bk["tid"].fillna("") + "\n📍 " + bk["plats"].fillna("") + ("\n💰 " + bk["ersattning"]) .fillna("")
+        )
+    ct = dfc.copy()
+    if not ct.empty:
+        ct["typ"] = "Kontakt"
+        ct["titel"] = ct["namn"].fillna("") + " – " + ct["foretag"].fillna("")
+        ct["beskrivning"] = (
+            "📞 " + ct["telefon"].fillna("") + "\n✉️ " + ct["mail"].fillna("") + "\n" + ct["kommentar"].fillna("")
+        )
+
+    all_items = pd.concat([bk, ct], ignore_index=True) if not bk.empty or not ct.empty else pd.DataFrame()
+
+    cols = st.columns(len(KANBAN_STATI))
+    for i, status in enumerate(KANBAN_STATI):
+        with cols[i]:
+            st.markdown(f"### {status}")
+            subset = all_items[all_items["status"] == status] if not all_items.empty else pd.DataFrame()
+            if subset.empty:
+                st.caption("(inget)")
+            else:
+                for _, row in subset.iterrows():
+                    with st.container(border=True):
+                        st.markdown(f"**{row['titel']}**")
+                        st.caption(row.get("typ", ""))
+                        st.markdown(f"<pre style='white-space:pre-wrap'>{row['beskrivning']}</pre>", unsafe_allow_html=True)
+                        new_status = st.selectbox(
+                            "Byt status",
+                            KANBAN_STATI,
+                            index=KANBAN_STATI.index(row.get("status", "Ny")) if row.get("status", "Ny") in KANBAN_STATI else 0,
+                            key=f"status_{row['typ']}_{row['id']}",
+                        )
+                        if new_status != row.get("status", "Ny"):
+                            if row["typ"] == "Bokning":
+                                df.loc[df["id"] == row["id"], "status"] = new_status
+                                save_bookings(df)
+                            else:
+                                dfc.loc[dfc["id"] == row["id"], "status"] = new_status
+                                save_contacts(dfc)
+                            st.experimental_rerun()
 
 elif page == "Alla bokningar":
     st.subheader("Samtliga bokningar")
@@ -352,33 +393,28 @@ elif page == "Export / Import":
     if uploaded is not None:
         try:
             new_df = pd.read_csv(uploaded, dtype=str, encoding="utf-8")
-            # Grundläggande kolumnkontroll
-            required_cols = {"id", "skapad", "kund", "uppdrag", "datum", "tid", "plats", "ersattning"}
-            if not required_cols.issubset(set(map(str.lower, new_df.columns))):
-                st.error("CSV saknar nödvändiga kolumner.")
+            required_cols = {"id", "skapad", "kund", "uppdrag", "datum", "tid", "plats", "ersattning", "status"}
+            lower = {c.lower() for c in new_df.columns}
+            if not required_cols.issubset(lower):
+                st.error("CSV saknar nödvändiga kolumner (inkl. status).")
             else:
-                # Normalisera kolumnnamn till rätt ordning/format
                 new_df.columns = [c.lower() for c in new_df.columns]
-                new_df = new_df[["id", "skapad", "kund", "uppdrag", "datum", "tid", "plats", "ersattning"]]
-                new_df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+                new_df = new_df[["id", "skapad", "kund", "uppdrag", "datum", "tid", "plats", "ersattning", "status"]]
+                save_bookings(new_df)
                 st.success("CSV importerad och sparad.")
         except Exception as e:
             st.error(f"Kunde inte läsa CSV: {e}")
 
 elif page == "Inställningar":
     st.subheader("Inställningar")
-    st.write("Här kan du framöver lägga till t.ex. standardvärden och integrationer mot andra system, m.m.")
-
-    # Visa sökväg till datafilen
     ensure_data_store()
     st.code(str(DATA_FILE.resolve()))
-
+    st.code(str(CONTACTS_FILE.resolve()))
     st.markdown(
         """
-        **Tips för nästa steg**
-        - Byt lagring från CSV till en extern datakälla (t.ex. databas).
-        - Lägg till filter/sök i vyn *Alla bokningar*.
-        - Koppla formuläret till e-post/SMS-bekräftelse via Power Automate.
-        - Lägg till fältvalidering (t.ex. datum i framtiden, format på ersättning).
+        **Tips**
+        - Lägg till filtrering/sök i Kanban.
+        - Koppla statusbyte till Make-webhook (t.ex. skicka händelser vid uppdatering).
+        - Bygg *Alla kontakter*-vy om du vill granska inkommande leads separat.
         """
     )
