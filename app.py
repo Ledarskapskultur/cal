@@ -16,10 +16,15 @@ from datetime import date, time, datetime
 
 import pandas as pd
 import streamlit as st
+import requests
 
 APP_TITLE = "Bokningar"
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "bookings.csv"
+# Make.com webhook (kan sättas i .streamlit/secrets.toml)
+DEFAULT_MAKE_URL = st.secrets.get("MAKE_WEBHOOK_URL", "https://hook.eu2.make.com/b3errrh3g6qttaxya7b8ge1egggwiqs6")
+DEFAULT_MAKE_HEADER_NAME = st.secrets.get("MAKE_HEADER_NAME", "")
+DEFAULT_MAKE_HEADER_VALUE = st.secrets.get("MAKE_HEADER_VALUE", "")
 
 # -------- Hjälpfunktioner -------- #
 def ensure_data_store() -> None:
@@ -67,6 +72,19 @@ def append_booking(row: dict) -> None:
     df.to_csv(DATA_FILE, index=False, encoding="utf-8")
 
 
+def send_to_make(webhook_url: str, payload: dict, headers: dict | None = None) -> tuple[bool, str]:
+    """Skicka JSON till Make.com webhook. Returnerar (ok, message)."""
+    if not webhook_url:
+        return False, "Ingen webhook-url angiven."
+    try:
+        resp = requests.post(webhook_url, json=payload, headers=headers or {}, timeout=10)
+        if 200 <= resp.status_code < 300:
+            return True, f"Webhook OK (status {resp.status_code})."
+        return False, f"Webhook fel (status {resp.status_code}): {resp.text[:500]}"
+    except Exception as e:
+        return False, f"Webhook undantag: {e}"
+
+
 # -------- UI & Layout -------- #
 st.set_page_config(page_title=APP_TITLE, page_icon="📅", layout="centered")
 
@@ -98,6 +116,19 @@ with st.sidebar:
         index=0,
     )
     st.markdown("<p class='small-muted'>Den här menyn är förberedd för framtida sidor.</p>", unsafe_allow_html=True)
+
+    with st.expander("Integrationer (Make.com)"):
+        st.text("Skicka bokningar till ett Make-scenario via webhook.")
+        st.session_state.setdefault("make_url", DEFAULT_MAKE_URL)
+        st.session_state.setdefault("make_header_name", DEFAULT_MAKE_HEADER_NAME)
+        st.session_state.setdefault("make_header_value", DEFAULT_MAKE_HEADER_VALUE)
+        st.session_state["make_url"] = st.text_input("Webhook URL", value=st.session_state["make_url"], placeholder="https://hook.eu1.make.com/....")
+        cols = st.columns(2)
+        with cols[0]:
+            st.session_state["make_header_name"] = st.text_input("Valfri header-namn", value=st.session_state["make_header_name"], placeholder="X-API-Key")
+        with cols[1]:
+            st.session_state["make_header_value"] = st.text_input("Valfri header-värde", value=st.session_state["make_header_value"], type="password")
+        st.caption("Tips: Lägg dessa värden i secrets för drift.")
 
 
 # -------- Sidor -------- #
@@ -149,6 +180,18 @@ if page == "Ny bokning":
             }
             append_booking(row)
             st.success("Bokningen sparades.")
+
+            # --- Skicka till Make.com webhook om satt ---
+            webhook_url = st.session_state.get("make_url") or DEFAULT_MAKE_URL
+            headers = {}
+            if st.session_state.get("make_header_name") and st.session_state.get("make_header_value"):
+                headers[st.session_state["make_header_name"]] = st.session_state["make_header_value"]
+
+            ok, msg = send_to_make(webhook_url, row, headers=headers)
+            if ok:
+                st.info(f"Skickat till Make: {msg}")
+            else:
+                st.warning(f"Kunde inte skicka till Make: {msg}")
             with st.expander("Visa sparad post"):
                 st.json(row)
 
@@ -203,7 +246,7 @@ elif page == "Export / Import":
 
 elif page == "Inställningar":
     st.subheader("Inställningar")
-    st.write("Här kan du framöver lägga till t.ex. standardvärden, integration mot SharePoint/Outlook, m.m.")
+    st.write("Här kan du framöver lägga till t.ex. standardvärden och integrationer mot andra system, m.m.")
 
     # Visa sökväg till datafilen
     ensure_data_store()
@@ -212,7 +255,7 @@ elif page == "Inställningar":
     st.markdown(
         """
         **Tips för nästa steg**
-        - Byt lagring från CSV till SharePoint/Microsoft Lists eller en databas.
+        - Byt lagring från CSV till en extern datakälla (t.ex. databas).
         - Lägg till filter/sök i vyn *Alla bokningar*.
         - Koppla formuläret till e-post/SMS-bekräftelse via Power Automate.
         - Lägg till fältvalidering (t.ex. datum i framtiden, format på ersättning).
